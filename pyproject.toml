@@ -1,0 +1,61 @@
+[project]
+name = "pg-multi-mcp"
+version = "0.1.0"
+description = "MCP local com múltiplas conexões de banco nomeadas (PostgreSQL), gerenciadas pela IA"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "mcp[cli]>=1.25.0,<2.0",
+    "psycopg[binary]>=3.3.2",
+    "psycopg-pool>=3.3.0",
+    "pglast>=7.20,<8",
+    "humanize>=4.15.0",
+    "attrs>=25.4.0",
+]
+license = "MIT"
+license-files = ["LICENSE"]
+
+[project.urls]
+Homepage = "https://github.com/Snarloff/pg-multi-mcp"
+Repository = "https://github.com/Snarloff/pg-multi-mcp"
+Issues = "https://github.com/Snarloff/pg-multi-mcp/issues"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project.scripts]
+pg-multi-mcp = "pg_multi_mcp:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+    "pytest-asyncio>=1.3.0",
+    "ruff==0.14.13",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["./src"]
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+line-length = 150
+target-version = "py312"
+exclude = [".venv*"]
+
+lint.select = ["E", "F", "I", "B", "W", "N", "UP", "RUF"]
+lint.ignore = [
+    "UP006",  # Use `list` instead of `List` for type annotations
+    "UP035",  # Import from `collections.abc` instead of `typing`
+    "UP045",  # Use `X | None` instead of `Optional[X]`
+    "UP007",  # Use `X | Y` for type annotations
+    "RUF001", # ambiguous unicode (pt-BR strings)
+    "RUF002",
+    "RUF003",
+    "RUF059", # Unused unpacked variable
+    "RUF100", # Unused noqa directive
+]
+
+[tool.ruff.lint.isort]
+force-single-line = true
+known-first-party = ["pg_multi_mcp"]

@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "pg-multi-mcp": {
+      "command": "C:\Users\<voce>\Desktop\Projetos\postmcp\.venv\Scripts\pg-multi-mcp.exe",
+      "args": ["--config", "~/.pg-multi-mcp/connections.json"],
+      "env": {
+        "PG_LOCAL_PASSWORD": "${PG_LOCAL_PASSWORD}",
+        "PG_MULTI_MCP_CONN_PROJETO_DEV": "postgresql://postgres:${PG_LOCAL_PASSWORD}@localhost:5432/projeto_dev",
+        "PG_MULTI_MCP_CONN_PROJETO_HML": "{\"url\": \"postgresql://leitura@homolog.exemplo.local/projeto\", \"aliases\": [\"homolog\"], \"tags\": [\"homologacao\"]}",
+        "PG_MULTI_MCP_DEFAULT": "projeto_dev"
+      }
+    }
+  }
+}

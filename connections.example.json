@@ -1,0 +1,48 @@
+{
+  "default": "local",
+  "settings": {
+    "idle_timeout_seconds": 600,
+    "max_open_connections": 10
+  },
+  "connections": {
+    "local": {
+      "engine": "postgres",
+      "url": "postgresql://postgres:${PG_LOCAL_PASSWORD}@localhost:5432/postgres",
+      "access_mode": "unrestricted",
+      "description": "Local development database",
+      "aliases": [
+        "dev",
+        "localhost"
+      ],
+      "tags": [
+        "development"
+      ]
+    },
+    "sales_staging": {
+      "url": "host=staging.example.com port=5432 dbname=sales user=readonly password=${PG_SALES_STG_PASSWORD} sslmode=require",
+      "access_mode": "restricted",
+      "description": "Sales - staging (read-only)",
+      "aliases": [
+        "sales staging"
+      ],
+      "tags": [
+        "staging",
+        "sales"
+      ],
+      "max_pool_size": 2,
+      "query_timeout": 30
+    },
+    "sales_prod": {
+      "url": "postgresql://readonly@prod.example.com:5432/sales?sslmode=require",
+      "access_mode": "restricted",
+      "description": "Sales - production (password via pgpass)",
+      "aliases": [
+        "sales"
+      ],
+      "tags": [
+        "production",
+        "sales"
+      ]
+    }
+  }
+}
