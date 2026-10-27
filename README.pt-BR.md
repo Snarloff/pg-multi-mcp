@@ -6,9 +6,9 @@ Servidor [MCP](https://modelcontextprotocol.io) local que dá a um assistente de
 banco nomeadas ao mesmo tempo**. Você diz *"lista as tabelas do banco de homologação"* e o assistente encontra a
 conexão certa pelo nome ou apelido, reaproveita um pool já aberto e fecha os pools que ficaram ociosos.
 
-Hoje suporta **PostgreSQL**. O núcleo (registro de conexões, resolução de nomes, ciclo de vida dos pools, reload
-da configuração) não depende do motor: cada conexão tem um campo `engine` e o código específico do PostgreSQL fica
-em um subpacote próprio, para que outros motores possam ser adicionados depois.
+Suporta **PostgreSQL** e **MongoDB**. O núcleo (registro de conexões, resolução de nomes, ciclo de vida dos pools,
+reload da configuração) não depende do motor: cada conexão tem um campo `engine` (inferido da URL quando omitido) e o
+código específico de cada motor fica em um subpacote próprio (`postgres/`, `mongodb/`).
 
 ---
 
@@ -48,7 +48,8 @@ em um subpacote próprio, para que outros motores possam ser adicionados depois.
 | Erros de conexão reais e rápidos | Senha errada, DNS ou porta fechada aparecem em segundos, não como timeout genérico |
 | Reload da configuração | Edições no arquivo valem na próxima chamada; conexões inalteradas mantêm o pool |
 | Ferramentas de análise PostgreSQL | Plano de execução (inclusive índices hipotéticos via HypoPG), health check, recomendação de índices, top queries |
-| Tamanho de resposta controlado | `execute_sql` trunca resultados grandes (`max_rows`, padrão 500) |
+| Suporte a MongoDB | `execute_mongo` (find, aggregate, count, distinct, comandos de leitura; escrita em `unrestricted`), além de bancos, collections, índices e schema inferido por amostragem nas ferramentas genéricas |
+| Tamanho de resposta controlado | `execute_sql` e `execute_mongo` truncam resultados grandes (`max_rows`, padrão 500); no MongoDB o corte é feito no servidor |
 | Sem vazamento de segredo | Senhas nunca aparecem em listagens nem em mensagens de erro |
 
 ## Requisitos
@@ -58,6 +59,7 @@ em um subpacote próprio, para que outros motores possam ser adicionados depois.
 - Opcional: [`uv`](https://docs.astral.sh/uv/), para rodar com `uvx` em vez de um virtualenv local
 - Extensões PostgreSQL opcionais para algumas ferramentas: `pg_stat_statements` (top queries, análise de
   workload) e `hypopg` (índices hipotéticos)
+- MongoDB **4.2+** para conexões MongoDB (driver: `pymongo` com o cliente asyncio nativo)
 
 ## Instalação
 
@@ -150,6 +152,12 @@ chamada `default` (somente leitura).
       "tags": ["homologacao", "relatorios"],
       "max_pool_size": 2,
       "query_timeout": 30
+    },
+    "pedidos_mongo": {
+      "url": "mongodb://leitor:${MONGO_PEDIDOS_PASSWORD}@mongo.exemplo.com.br:27017/pedidos?authSource=admin&tls=true",
+      "description": "Pedidos - MongoDB (somente leitura)",
+      "aliases": ["pedidos"],
+      "tags": ["mongodb"]
     }
   }
 }
@@ -169,14 +177,14 @@ chamada `default` (somente leitura).
 | Campo | Obrigatório | Padrão | Descrição |
 |---|---|---|---|
 | *(chave)* | sim | — | Nome da conexão: letras, números, `_`, `-`, `.`; até 63 caracteres |
-| `url` | sim | — | URI libpq (`postgresql://usuario@host:porta/banco?sslmode=require`) ou DSN chave/valor (`host=... dbname=...`). Placeholders `${VAR}` são expandidos de variáveis de ambiente na hora de conectar |
-| `engine` | não | `postgres` | Motor do banco (`postgresql` e `pg` são aceitos como apelidos) |
-| `access_mode` | não | `restricted` | `restricted` = somente leitura; `unrestricted` = qualquer SQL, inclusive DML/DDL |
+| `url` | sim | — | PostgreSQL: URI libpq (`postgresql://usuario@host:porta/banco?sslmode=require`) ou DSN chave/valor (`host=... dbname=...`). MongoDB: URI `mongodb://` ou `mongodb+srv://`; o caminho é o banco padrão. Placeholders `${VAR}` são expandidos de variáveis de ambiente na hora de conectar (em usuário/senha MongoDB o valor é percent-encoded automaticamente) |
+| `engine` | não | pela URL | `postgres` ou `mongodb`; inferido da URL (`mongodb://`, `mongodb+srv://` → `mongodb`, qualquer outra → `postgres`); se a URL inteira for um placeholder como `${MONGO_URI}`, informe `engine`. Apelidos: `postgresql`, `pg`, `mongo` |
+| `access_mode` | não | `restricted` | `restricted` = somente leitura; `unrestricted` = qualquer SQL / escrita MongoDB, inclusive DML/DDL |
 | `description` | não | `""` | Texto livre; usado na busca |
 | `aliases` | não | `[]` | Nomes alternativos para o assistente encontrar a conexão |
 | `tags` | não | `[]` | Rótulos de agrupamento/busca, como `producao`, `homologacao` |
 | `max_pool_size` | não | `3` | Máximo de conexões neste pool |
-| `query_timeout` | não | `30` | Timeout das queries, em segundos, nas conexões `restricted` |
+| `query_timeout` | não | `30` | Timeout das queries/operações, em segundos, nas conexões `restricted` |
 
 Nomes e aliases precisam ser únicos entre todas as conexões depois de normalizados (maiúsculas, acentos e
 separadores são ignorados): `Relatórios-HML`, `relatorios_hml` e `Relatorios HML` são a mesma chave.
@@ -307,17 +315,30 @@ linha como `[conexão: local | modo: unrestricted]`, então sempre fica claro on
 | `use_connection` | `connection` | Valida a conexão (abre) e a torna a conexão ativa da sessão |
 | `open_connection` | `connection?` | Abre ou reaproveita o pool e retorna banco, usuário, versão do servidor e latência |
 | `close_connection` | `connection?`, `close_all=false` | Fecha um pool ou todos. A definição é mantida e reabre no próximo uso |
-| `add_connection` | `name`, `url`, `access_mode="restricted"`, `description`, `aliases`, `tags`, `persist=true`, `test=true`, `overwrite=false`, `engine="postgres"` | Adiciona conexão. Com `test=true` conecta antes e não adiciona nada se falhar. Com `persist=true` grava no arquivo; senão existe só na sessão |
+| `add_connection` | `name`, `url`, `access_mode="restricted"`, `description`, `aliases`, `tags`, `persist=true`, `test=true`, `overwrite=false`, `engine` (inferido da URL) | Adiciona conexão. Com `test=true` conecta antes e não adiciona nada se falhar. Com `persist=true` grava no arquivo; senão existe só na sessão |
 | `remove_connection` | `connection` | Fecha e remove a conexão (também do arquivo, se veio dele). Remover uma sobreposição da env traz de volta a do arquivo |
 | `reload_connections` | — | Relê o arquivo agora e informa `added`, `changed`, `removed`, `unchanged` |
 
-### Banco (PostgreSQL)
+### Banco (PostgreSQL e MongoDB)
+
+| Ferramenta | Principais argumentos | PostgreSQL | MongoDB |
+|---|---|---|---|
+| `list_schemas` | — | Lista schemas e classifica em usuário/sistema | Lista os bancos visíveis ao usuário, com tamanho |
+| `list_objects` | `schema_name`, `object_type="table"` | Lista tabelas, views, sequences ou extensões | `schema_name` é o banco; `object_type` `collection`/`table` ou `view` |
+| `get_object_details` | `schema_name`, `object_name`, `object_type="table"` | Colunas, constraints e índices de tabela/view; detalhes de sequence ou extensão | Tipo, contagem estimada, índices e os campos/tipos encontrados em uma amostra de 100 documentos (nome do campo, tipos e em quantos documentos aparece — **nunca os valores**) |
+
+### MongoDB
 
 | Ferramenta | Principais argumentos | O que faz |
 |---|---|---|
-| `list_schemas` | — | Lista schemas e classifica em usuário/sistema |
-| `list_objects` | `schema_name`, `object_type="table"` | Lista tabelas, views, sequences ou extensões |
-| `get_object_details` | `schema_name`, `object_name`, `object_type="table"` | Colunas, constraints e índices de tabela/view; detalhes de sequence ou extensão |
+| `execute_mongo` | `operation`, `collection`, `database?`, `filter={}`, `projection?`, `sort?`, `skip=0`, `limit=0`, `pipeline=[]`, `field?`, `documents=[]`, `update?`, `upsert=false`, `command?`, `explain=false`, `max_rows=500` | Leitura: `find`, `aggregate`, `count`, `distinct`, `command`. Escrita (só em `unrestricted`): `insert_one`, `insert_many`, `update_one`, `update_many`, `replace_one`, `delete_one`, `delete_many`. `filter`/`pipeline` aceitam Extended JSON (`{"_id": {"$oid": "..."}}`); o resultado volta em Extended JSON relaxed. `explain=true` retorna o plano de um `find`/`aggregate`. `database` padrão = o da URL |
+
+### Só PostgreSQL
+
+Recusam conexões MongoDB com mensagem clara (antes de abrir pool).
+
+| Ferramenta | Principais argumentos | O que faz |
+|---|---|---|
 | `execute_sql` | `sql`, `max_rows=500` | Executa SQL. Somente leitura em conexões `restricted`. Acima de `max_rows` o resultado é truncado e sinalizado |
 | `explain_query` | `sql`, `analyze=false`, `hypothetical_indexes=[]` | Plano de execução; `analyze=true` executa a query para tempos reais; índices hipotéticos exigem HypoPG |
 | `analyze_workload_indexes` | `max_index_size_mb=10000` | Recomenda índices a partir do workload em `pg_stat_statements` |
@@ -384,7 +405,17 @@ Mudanças no próprio `.mcp.json` só são lidas quando o cliente reinicia o ser
 - Tudo roda dentro de uma transação `READ ONLY`, então o próprio PostgreSQL rejeita qualquer escrita que passe.
 - Queries são abortadas após `query_timeout` segundos.
 
-**`unrestricted`**: qualquer SQL, inclusive `INSERT`, `UPDATE`, `DELETE`, `DROP`. Use só em bancos que são seus.
+**`restricted` no MongoDB** — o MongoDB não tem transação somente leitura, então a lista de permissões é a única
+barreira da aplicação; **use um usuário com a role `read`** como garantia real.
+
+- Só `find`, `aggregate`, `count`, `distinct` e alguns comandos de leitura (`ping`, `buildInfo`, `dbStats`,
+  `collStats`, `listCollections`, `listIndexes`, `listDatabases`, `serverStatus`, `connectionStatus`, `hostInfo`).
+- `$out` e `$merge` (escrita) e `$where`, `$function`, `$accumulator` (JavaScript no servidor) são recusados em
+  qualquer nível do filtro ou pipeline (inclusive dentro de `$lookup`, `$facet`, `$unionWith`).
+- Toda operação é abortada após `query_timeout` segundos.
+
+**`unrestricted`**: qualquer SQL, inclusive `INSERT`, `UPDATE`, `DELETE`, `DROP`; no MongoDB, também as operações de
+insert, update, replace e delete. Use só em bancos que são seus.
 
 **Teto global:** `--access-mode restricted` força todas as conexões a somente leitura, mesmo que alguém coloque
 `unrestricted` no arquivo ou adicione uma pelo chat. `--lock-config` também impede adicionar ou remover conexões.
@@ -425,6 +456,9 @@ Mudanças no próprio `.mcp.json` só são lidas quando o cliente reinicia o ser
 | `config_error` em `list_connections` | O arquivo tem JSON inválido ou nome/alias duplicado; a mensagem mostra linha/coluna |
 | `conflita com a conexão existente` / `usado por` | Duas conexões compartilham nome ou alias depois da normalização |
 | Query recusada em modo restricted | O comando ou uma função não está na lista de leitura. Use `SELECT` ou uma conexão `unrestricted` |
+| `esta ferramenta só funciona com postgres` / `mongodb` | A ferramenta não se aplica a esse motor: no MongoDB use `execute_mongo` em vez de `execute_sql`; `explain_query`, `analyze_*` e `get_top_queries` são só PostgreSQL |
+| MongoDB `Authentication failed` | Usuário/senha ou `authSource` errados (usuários criados no `admin` precisam de `?authSource=admin`) |
+| MongoDB `Informe o banco` | A URL não tem banco padrão: passe `database` / `schema_name` ou acrescente `/banco` na URL |
 | Mudanças no `.mcp.json` não aplicadas | O cliente só lê o arquivo ao (re)iniciar o servidor: reinicie ou reconecte |
 | `WinError 32` ao reinstalar (`pip install -e .`) | O cliente MCP está rodando o `pg-multi-mcp.exe` e o Windows trava o arquivo. Pare ou desative o servidor no cliente antes (Claude Code: `/mcp`), reinstale e reconecte. Mudanças em `src/` não exigem reinstalar, só reiniciar o servidor |
 | Precisa de mais detalhe | Rode com `--log-level DEBUG`; os logs vão para o stderr / log MCP do cliente |
@@ -437,6 +471,7 @@ src/
     ├── __init__.py          main(): inicia o event loop (SelectorEventLoop no Windows)
     ├── server.py            Ferramentas MCP e opções de linha de comando
     ├── connections.py       Registro, resolução de nomes, pools, LRU, reaper, reload, persistência
+    ├── mongodb/             Código específico do MongoDB: pool, driver, validação somente leitura, amostragem de schema
     └── postgres/            Código específico do PostgreSQL
         ├── sql/             Driver, pool, validação de SQL somente leitura, extensões
         ├── explain/         Planos de execução e índices hipotéticos
@@ -446,16 +481,18 @@ src/
 tests/
 ├── unit/test_connections.py Registro, reload, env, persistência
 ├── unit/test_server.py      Roteamento e respostas das ferramentas
+├── unit/mongodb/            Testes dos módulos MongoDB (validação somente leitura, driver)
 └── unit/postgres/           Testes dos módulos PostgreSQL
 ```
 
-**Adicionando outro motor (roteiro):**
+**Adicionando outro motor** (o MongoDB seguiu estes passos):
 
-1. Adicione um valor em `Engine` em [connections.py](src/pg_multi_mcp/connections.py).
-2. Crie `src/pg_multi_mcp/<motor>/` com um driver: pool, execução de queries e modo somente leitura.
-3. Faça o `ConnectionManager` escolher pool/driver pelo `engine` da conexão.
-4. Despache as ferramentas genéricas (`list_schemas`, `execute_sql`, ...) por engine; as exclusivas do PostgreSQL
-   recusam outros motores.
+1. Adicione um valor em `Engine` em [connections.py](src/pg_multi_mcp/connections.py) (e a inferência pela URL, se o motor tiver esquema próprio).
+2. Crie `src/pg_multi_mcp/<motor>/` com um pool (mesma interface do `DbConnPool`: `pool_connect()`, `close()`,
+   `pool`, `server_version`), um driver e um modo somente leitura.
+3. Escolha pool/driver pelo `engine` da conexão em `ConnectionManager._ensure_open` e `lease`.
+4. Despache as ferramentas genéricas (`list_schemas`, `list_objects`, ...) por `lease.engine`; ferramentas de um motor
+   só passam `require=Engine.X` ao `lease`, que recusa os outros motores antes de abrir pool.
 
 ## Desenvolvimento
 

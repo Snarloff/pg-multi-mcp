@@ -1,14 +1,17 @@
+import inspect
 import json
 from unittest.mock import AsyncMock
 from unittest.mock import patch
 
 import pytest
+from pydantic.fields import FieldInfo
 from test_connections import FakePool
 
 import pg_multi_mcp.server as server
 from pg_multi_mcp.connections import AccessMode
 from pg_multi_mcp.connections import ConnectionConfig
 from pg_multi_mcp.connections import ConnectionManager
+from pg_multi_mcp.mongodb import MongoDriver
 from pg_multi_mcp.postgres.sql import SqlDriver
 
 
@@ -171,3 +174,38 @@ async def test_reload_connections_tool_reports_invalid_file(manager):
     assert out.startswith("Error: Arquivo não recarregado")
     listed = json.loads(text(await server.list_connections(search=None)))
     assert "config_error" in listed
+
+
+
+async def call_tool(fn, **kwargs):
+    """Call a tool function directly, resolving the pydantic Field defaults of omitted arguments."""
+    params = inspect.signature(fn).parameters
+    defaults = {n: p.default.default for n, p in params.items() if n not in kwargs and isinstance(p.default, FieldInfo)}
+    return await fn(**defaults, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_pg_only_tools_reject_mongo_connection(manager):
+    manager.register(ConnectionConfig(name="docs", url="mongodb://u@h/app", persistent=False))
+    for fn in (server.execute_sql, server.explain_query, server.get_top_queries, server.analyze_db_health):
+        kwargs = {"sql": "SELECT 1"} if fn in (server.execute_sql, server.explain_query) else {}
+        assert "só funciona com postgres" in text(await call_tool(fn, connection="docs", **kwargs))
+    assert not manager.resolve("docs").is_open
+
+    out = text(await call_tool(server.execute_mongo, operation="find", collection="c", connection="local"))
+    assert "só funciona com mongodb" in out
+
+
+@pytest.mark.asyncio
+async def test_execute_mongo_routes_to_driver(manager):
+    manager.register(ConnectionConfig(name="docs", url="mongodb://u@h/app", persistent=False))
+    seen = {}
+
+    async def fake_execute(self, operation, **kwargs):
+        seen.update(operation=operation, readonly=self.readonly, **kwargs)
+        return [{"ok": 1}]
+
+    with patch("pg_multi_mcp.connections.MongoConnPool", FakePool), patch.object(MongoDriver, "execute", fake_execute):
+        out = text(await call_tool(server.execute_mongo, operation="count", collection="orders", filter={"status": "open"}, connection="docs"))
+    assert out.startswith("[conexão: docs | modo: restricted]")
+    assert seen["operation"] == "count" and seen["readonly"] is True and seen["filter"] == {"status": "open"}

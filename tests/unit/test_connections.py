@@ -359,6 +359,57 @@ def test_engine_defaults_to_postgres_and_accepts_aliases():
         cfg("c", engine="oracle")
 
 
+def test_engine_inferred_from_mongo_url():
+    assert cfg("m", url="mongodb://u@h/app").engine == Engine.MONGODB
+    assert cfg("s", url="mongodb+srv://u@cluster.example.net/app").engine == Engine.MONGODB
+    assert cfg("x", url="mongodb://u@h/app", engine="mongo").engine == Engine.MONGODB
+    assert ConnectionConfig.from_dict("f", {"url": "mongodb://h/app"}).engine == Engine.MONGODB
+    assert ConnectionConfig.from_dict("f", {"url": "mongodb://h/app"}).to_dict()["engine"] == "mongodb"
+
+
+def test_mongo_url_placeholders_are_percent_encoded_in_userinfo(monkeypatch):
+    monkeypatch.setenv("MONGO_PW", "p@ss:w/rd")
+    monkeypatch.setenv("MONGO_HOST", "db.example.com")
+    config = cfg("m", url="mongodb://app:${MONGO_PW}@${MONGO_HOST}:27017/app?authSource=admin")
+    assert config.resolved_url() == "mongodb://app:p%40ss%3Aw%2Frd@db.example.com:27017/app?authSource=admin"
+    # PostgreSQL keeps the raw value (libpq DSN / URI handled as before)
+    assert cfg("p", url="postgresql://u:${MONGO_PW}@h/db").resolved_url() == "postgresql://u:p@ss:w/rd@h/db"
+
+
+def test_has_literal_password_mongo():
+    assert has_literal_password("mongodb://app:plain@h/db")
+    assert not has_literal_password("mongodb://app:${MONGO_PW}@h/db")
+    assert not has_literal_password("mongodb+srv://app@cluster.example.net/db")
+
+
+@pytest.mark.asyncio
+async def test_mongo_lease_uses_mongo_pool_and_driver(fake_pool):
+    from pg_multi_mcp.mongodb import MongoDriver
+
+    manager = make_manager(
+        cfg("docs", url="mongodb://u@h/app"),
+        cfg("docs_rw", url="mongodb://u@h/rw", access_mode=AccessMode.UNRESTRICTED),
+    )
+    with patch("pg_multi_mcp.connections.MongoConnPool", fake_pool):
+        async with manager.lease("docs") as lease:
+            assert lease.engine == Engine.MONGODB
+            assert isinstance(lease.driver, MongoDriver)
+            assert lease.driver.readonly and lease.driver.timeout == 30
+        async with manager.lease("docs_rw") as lease:
+            assert not lease.driver.readonly and lease.driver.timeout is None
+    assert [p.connection_url for p in fake_pool.instances] == ["mongodb://u@h/app", "mongodb://u@h/rw"]
+
+
+@pytest.mark.asyncio
+async def test_lease_require_rejects_other_engine_before_opening(fake_pool):
+    manager = make_manager(cfg("docs", url="mongodb://u@h/app"))
+    with pytest.raises(ConnectionConfigError, match="só funciona com postgres"):
+        async with manager.lease("docs", require=Engine.POSTGRES):
+            pass
+    assert fake_pool.instances == []
+    assert not manager.resolve("docs").is_open
+
+
 def test_load_env_plain_url_and_json():
     manager = ConnectionManager()
     manager.load_env(
