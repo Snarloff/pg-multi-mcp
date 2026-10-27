@@ -23,7 +23,6 @@ from .connections import ConnectionConfig
 from .connections import ConnectionLease
 from .connections import ConnectionManager
 from .connections import Engine
-from .connections import expand_env
 from .connections import has_literal_password
 from .connections import probe_connection
 from .postgres.artifacts import ErrorResult
@@ -41,7 +40,7 @@ from .postgres.sql import obfuscate_password
 from .postgres.top_queries import TopQueriesCalc
 
 INSTRUCTIONS = """\
-Servidor MCP com MÚLTIPLAS conexões PostgreSQL nomeadas.
+Servidor MCP com MÚLTIPLAS conexões de banco nomeadas (PostgreSQL e MongoDB).
 
 Fluxo recomendado:
 1. Quando o usuário citar um banco, sistema, projeto ou ambiente, chame list_connections(search="<termo>")
@@ -54,6 +53,10 @@ Fluxo recomendado:
    O arquivo de conexões é recarregado sozinho quando editado; reload_connections força a releitura e mostra o que mudou.
 5. Conexões em modo 'restricted' são somente leitura. Nunca tente contornar essa restrição.
 6. Não peça nem repita senhas no chat. Para novas conexões prefira placeholders ${VAR} de variável de ambiente.
+7. O campo 'engine' de list_connections diz o motor. Em conexões 'mongodb' use execute_mongo (find, aggregate, count,
+   distinct, ...) em vez de execute_sql; list_schemas lista os bancos, list_objects lista as collections
+   (schema_name = banco) e get_object_details mostra índices e campos inferidos por amostragem.
+   explain_query, analyze_*, get_top_queries e execute_sql são só PostgreSQL.
 """
 
 # Initialize FastMCP with default settings
@@ -174,6 +177,8 @@ async def open_connection(
     try:
         started = time.perf_counter()
         async with connections.lease(connection) as lease:
+            if lease.engine == Engine.MONGODB:
+                return format_text_response(await lease.driver.server_info(), lease)  # type: ignore[union-attr]
             rows = await lease.driver.execute_query(
                 "SELECT current_database() AS database, current_user AS user, version() AS version"
             )
@@ -209,8 +214,9 @@ async def close_connection(
 
 
 @mcp.tool(
-    description="Adiciona uma conexão nomeada. A 'url' aceita URI (postgresql://...) ou DSN (host=... dbname=...) e "
-    "placeholders ${VAR} resolvidos de variáveis de ambiente — prefira-os a senhas literais. "
+    description="Adiciona uma conexão nomeada. A 'url' aceita URI (postgresql://... ou mongodb://, mongodb+srv://) ou "
+    "DSN PostgreSQL (host=... dbname=...) e placeholders ${VAR} resolvidos de variáveis de ambiente — prefira-os a senhas literais. "
+    "O 'engine' é inferido da URL quando omitido. "
     "Por padrão testa a conexão antes de salvar e grava no arquivo de configuração (persist=true).",
     annotations=ToolAnnotations(title="Add Connection", destructiveHint=False, idempotentHint=False),
 )
@@ -224,7 +230,7 @@ async def add_connection(
     persist: bool = Field(description="Grava no arquivo de configuração", default=True),
     test: bool = Field(description="Testa a conexão antes de manter", default=True),
     overwrite: bool = Field(description="Substitui conexão existente com o mesmo nome", default=False),
-    engine: str = Field(description=f"Motor do banco: {', '.join(e.value for e in Engine)}", default=Engine.POSTGRES.value),
+    engine: Optional[str] = Field(description=f"Motor do banco: {', '.join(e.value for e in Engine)} (omitido = inferido da URL)", default=None),
 ) -> ResponseType:
     try:
         config = ConnectionConfig(
@@ -240,7 +246,7 @@ async def add_connection(
         # Test before registering, so a failed overwrite keeps the previous definition
         if test:
             try:
-                await probe_connection(expand_env(url))
+                await probe_connection(config.resolved_url(), config.engine)
             except Exception as e:
                 return format_error_response(f"Conexão não adicionada: {e}")
         mc = await connections.add(config, overwrite=overwrite)
@@ -275,7 +281,7 @@ async def remove_connection(
 
 
 @mcp.tool(
-    description="List all schemas in the database",
+    description="List all schemas in the database (MongoDB: lists the databases)",
     annotations=ToolAnnotations(
         title="List Schemas",
         readOnlyHint=True,
@@ -287,6 +293,8 @@ async def list_schemas(
     """List all schemas in the database."""
     try:
         async with connections.lease(connection) as lease:
+            if lease.engine == Engine.MONGODB:
+                return format_text_response(await lease.driver.list_databases(), lease)  # type: ignore[union-attr]
             rows = await lease.driver.execute_query(
                 """
                 SELECT
@@ -309,20 +317,24 @@ async def list_schemas(
 
 
 @mcp.tool(
-    description="List objects in a schema",
+    description="List objects in a schema (MongoDB: collections or views in a database)",
     annotations=ToolAnnotations(
         title="List Objects",
         readOnlyHint=True,
     ),
 )
 async def list_objects(
-    schema_name: str = Field(description="Schema name"),
-    object_type: str = Field(description="Object type: 'table', 'view', 'sequence', or 'extension'", default="table"),
+    schema_name: str = Field(description="Schema name (MongoDB: database name)"),
+    object_type: str = Field(
+        description="Object type: 'table', 'view', 'sequence', or 'extension' (MongoDB: 'collection'/'table' or 'view')", default="table"
+    ),
     connection: Optional[str] = connection_field(),
 ) -> ResponseType:
     """List objects of a given type in a schema."""
     try:
         async with connections.lease(connection) as lease:
+            if lease.engine == Engine.MONGODB:
+                return format_text_response(await lease.driver.list_collections(schema_name, object_type), lease)  # type: ignore[union-attr]
             sql_driver = lease.driver
 
             if object_type in ("table", "view"):
@@ -388,21 +400,24 @@ async def list_objects(
 
 
 @mcp.tool(
-    description="Show detailed information about a database object",
+    description="Show detailed information about a database object. MongoDB: collection type, estimated count, indexes and "
+    "the fields/types inferred from a sample of documents (values are never returned).",
     annotations=ToolAnnotations(
         title="Get Object Details",
         readOnlyHint=True,
     ),
 )
 async def get_object_details(
-    schema_name: str = Field(description="Schema name"),
-    object_name: str = Field(description="Object name"),
-    object_type: str = Field(description="Object type: 'table', 'view', 'sequence', or 'extension'", default="table"),
+    schema_name: str = Field(description="Schema name (MongoDB: database name)"),
+    object_name: str = Field(description="Object name (MongoDB: collection or view)"),
+    object_type: str = Field(description="Object type: 'table', 'view', 'sequence', or 'extension' (ignored for MongoDB)", default="table"),
     connection: Optional[str] = connection_field(),
 ) -> ResponseType:
     """Get detailed information about a database object."""
     try:
         async with connections.lease(connection) as lease:
+            if lease.engine == Engine.MONGODB:
+                return format_text_response(await lease.driver.collection_details(schema_name, object_name), lease)  # type: ignore[union-attr]
             sql_driver = lease.driver
 
             if object_type in ("table", "view"):
@@ -567,7 +582,7 @@ If there is no hypothetical index, you can pass an empty list.""",
         connection: Connection name or alias
     """
     try:
-        async with connections.lease(connection) as lease:
+        async with connections.lease(connection, require=Engine.POSTGRES) as lease:
             sql_driver = lease.driver
             explain_tool = ExplainPlanTool(sql_driver=sql_driver)
             result: ExplainPlanArtifact | ErrorResult | None = None
@@ -616,7 +631,7 @@ async def execute_sql(
 ) -> ResponseType:
     """Executes a SQL query against the database."""
     try:
-        async with connections.lease(connection) as lease:
+        async with connections.lease(connection, require=Engine.POSTGRES) as lease:
             rows = await lease.driver.execute_query(sql)  # type: ignore
             if rows is None:
                 return format_text_response("No results", lease)
@@ -626,6 +641,64 @@ async def execute_sql(
             return format_text_response(result, lease)
     except Exception as e:
         logger.error(f"Error executing query: {e}")
+        return format_error_response(str(e))
+
+
+# Registered dynamically like execute_sql (description/annotations depend on the access cap)
+async def execute_mongo(
+    operation: str = Field(
+        description="find | aggregate | count | distinct | command (leitura); insert_one | insert_many | update_one | update_many | "
+        "replace_one | delete_one | delete_many (só em conexões 'unrestricted')"
+    ),
+    collection: Optional[str] = Field(description="Collection alvo (não usado em 'command')", default=None),
+    database: Optional[str] = Field(description="Banco; omitido = banco definido na URL da conexão", default=None),
+    filter: dict[str, Any] = Field(
+        description="Filtro de consulta (find, count, distinct, update_*, replace_one, delete_*). "
+        'Aceita Extended JSON, ex.: {"_id": {"$oid": "..."}}',
+        default={},
+    ),
+    projection: Optional[dict[str, Any]] = Field(description='Projeção do find, ex.: {"name": 1, "_id": 0}', default=None),
+    sort: Optional[dict[str, int]] = Field(description='Ordenação do find, ex.: {"created_at": -1}', default=None),
+    skip: int = Field(description="Documentos a pular (find)", default=0),
+    limit: int = Field(description="Limite do find (0 = até max_rows)", default=0),
+    pipeline: list[dict[str, Any]] = Field(description="Pipeline do aggregate", default=[]),
+    field: Optional[str] = Field(description="Campo do distinct", default=None),
+    documents: list[dict[str, Any]] = Field(description="Documentos para insert_one (um) / insert_many", default=[]),
+    update: Optional[dict[str, Any] | list[dict[str, Any]]] = Field(
+        description='Update (ex.: {"$set": {...}}) ou pipeline de update; em replace_one, o documento substituto', default=None
+    ),
+    upsert: bool = Field(description="Upsert em update_* / replace_one", default=False),
+    command: Optional[dict[str, Any]] = Field(
+        description="Comando de banco para operation='command', ex.: {'dbStats': 1}. Em 'restricted' só comandos de leitura.", default=None
+    ),
+    explain: bool = Field(description="Retorna o plano de execução (queryPlanner) em vez dos documentos (find/aggregate)", default=False),
+    connection: Optional[str] = connection_field(),
+    max_rows: int = Field(description="Máximo de documentos retornados (o excedente é truncado no servidor)", default=DEFAULT_MAX_ROWS),
+) -> ResponseType:
+    """Executes an operation against a MongoDB connection."""
+    try:
+        async with connections.lease(connection, require=Engine.MONGODB) as lease:
+            result = await lease.driver.execute(  # type: ignore[union-attr]
+                operation,
+                collection=collection,
+                database=database,
+                filter=filter,
+                projection=projection,
+                sort=sort,
+                skip=skip,
+                limit=limit,
+                pipeline=pipeline,
+                field=field,
+                documents=documents,
+                update=update,
+                upsert=upsert,
+                command=command,
+                explain=explain,
+                max_rows=max_rows,
+            )
+            return format_text_response(result, lease)
+    except Exception as e:
+        logger.error(f"Error executing MongoDB operation: {e}")
         return format_error_response(str(e))
 
 
@@ -642,7 +715,7 @@ async def analyze_workload_indexes(
 ) -> ResponseType:
     """Analyze frequently executed queries in the database and recommend optimal indexes."""
     try:
-        async with connections.lease(connection) as lease:
+        async with connections.lease(connection, require=Engine.POSTGRES) as lease:
             index_tuning = DatabaseTuningAdvisor(lease.driver)
             dta_tool = TextPresentation(lease.driver, index_tuning)
             result = await dta_tool.analyze_workload(max_index_size_mb=max_index_size_mb)
@@ -671,7 +744,7 @@ async def analyze_query_indexes(
         return format_error_response(f"Please provide a list of up to {MAX_NUM_INDEX_TUNING_QUERIES} queries to analyze.")
 
     try:
-        async with connections.lease(connection) as lease:
+        async with connections.lease(connection, require=Engine.POSTGRES) as lease:
             index_tuning = DatabaseTuningAdvisor(lease.driver)
             dta_tool = TextPresentation(lease.driver, index_tuning)
             result = await dta_tool.analyze_queries(queries=queries, max_index_size_mb=max_index_size_mb)
@@ -706,7 +779,7 @@ async def analyze_db_health(
 ) -> ResponseType:
     """Analyze database health for specified components."""
     try:
-        async with connections.lease(connection) as lease:
+        async with connections.lease(connection, require=Engine.POSTGRES) as lease:
             health_tool = DatabaseHealthTool(lease.driver)
             result = await health_tool.health(health_type=health_type)
             return format_text_response(result, lease)
@@ -733,7 +806,7 @@ async def get_top_queries(
     connection: Optional[str] = connection_field(),
 ) -> ResponseType:
     try:
-        async with connections.lease(connection) as lease:
+        async with connections.lease(connection, require=Engine.POSTGRES) as lease:
             top_queries_tool = TopQueriesCalc(sql_driver=lease.driver)
 
             if sort_by == "resources":
@@ -750,7 +823,7 @@ async def get_top_queries(
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="PostgreSQL MCP Server (multi-conexão)")
+    parser = argparse.ArgumentParser(description="MCP Server multi-conexão (PostgreSQL e MongoDB)")
     parser.add_argument(
         "--config",
         type=lambda value: Path(value).expanduser(),
@@ -798,6 +871,24 @@ def register_execute_sql(access_cap: Optional[AccessMode]) -> None:
         )
 
 
+def register_execute_mongo(access_cap: Optional[AccessMode]) -> None:
+    """Add the MongoDB operation tool with a description and annotations appropriate to the access mode."""
+    if access_cap == AccessMode.RESTRICTED:
+        mcp.add_tool(
+            execute_mongo,
+            description="Run a read-only MongoDB operation (find, aggregate, count, distinct, read-only commands) on the chosen connection",
+            annotations=ToolAnnotations(title="Execute MongoDB (Read-Only)", readOnlyHint=True),
+        )
+    else:
+        mcp.add_tool(
+            execute_mongo,
+            description="Run a MongoDB operation on the chosen connection. 'restricted' connections only accept reads "
+            "(find, aggregate without $out/$merge, count, distinct, read-only commands; no server-side JavaScript; timeout); "
+            "'unrestricted' connections also accept insert/update/replace/delete.",
+            annotations=ToolAnnotations(title="Execute MongoDB", destructiveHint=True),
+        )
+
+
 async def main(argv: Optional[list[str]] = None):
     args = build_arg_parser().parse_args(argv)
     logging.basicConfig(stream=sys.stderr, level=args.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -822,6 +913,7 @@ async def main(argv: Optional[list[str]] = None):
         connections.register(ConnectionConfig(name="default", url=database_url, persistent=False, source="env"))
 
     register_execute_sql(access_cap)
+    register_execute_mongo(access_cap)
     logger.info(
         f"Starting pg-multi-mcp with {len(connections.names)} connection(s); access cap: {access_cap.value if access_cap else 'per-connection'}"
     )

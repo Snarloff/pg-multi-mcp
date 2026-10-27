@@ -1,4 +1,4 @@
-"""Gerenciamento de múltiplas conexões PostgreSQL nomeadas.
+"""Gerenciamento de múltiplas conexões de banco nomeadas (PostgreSQL e MongoDB).
 
 Cada conexão é declarada no arquivo de configuração (JSON) ou adicionada em tempo de execução.
 O pool só é aberto no primeiro uso, é reaproveitado entre chamadas, fechado após inatividade
@@ -23,10 +23,17 @@ from typing import AsyncIterator
 from typing import Mapping
 from typing import Optional
 from typing import Union
+from urllib.parse import quote
 
 import psycopg
 from psycopg.conninfo import conninfo_to_dict
 
+from .mongodb import MongoConnPool
+from .mongodb import MongoDriver
+from .mongodb import is_mongo_url
+from .mongodb import mongo_password
+from .mongodb import mongo_target
+from .mongodb import probe_mongo
 from .postgres.sql import DbConnPool
 from .postgres.sql import SafeSqlDriver
 from .postgres.sql import SqlDriver
@@ -54,9 +61,10 @@ class Engine(str, Enum):
     """Motores de banco suportados. Novos motores entram aqui (driver + ferramentas)."""
 
     POSTGRES = "postgres"
+    MONGODB = "mongodb"
 
 
-_ENGINE_ALIASES = {"postgresql": "postgres", "pg": "postgres"}
+_ENGINE_ALIASES = {"postgresql": "postgres", "pg": "postgres", "mongo": "mongodb"}
 
 # Conexões declaradas por variável de ambiente (ex.: bloco "env" do .mcp.json)
 ENV_CONNECTION_PREFIX = "PG_MULTI_MCP_CONN_"
@@ -74,8 +82,11 @@ def normalize_name(value: str) -> str:
     return re.sub(r"[^a-z0-9]", "", without_accents.lower())
 
 
-def expand_env(value: str) -> str:
-    """Substitui ${VAR} pelo valor da variável de ambiente. Falha se alguma não existir."""
+def expand_env(value: str, quote_values: bool = False) -> str:
+    """Substitui ${VAR} pelo valor da variável de ambiente. Falha se alguma não existir.
+
+    quote_values=True aplica percent-encoding no valor (usuário/senha de URI MongoDB).
+    """
     missing: list[str] = []
 
     def replace(match: re.Match[str]) -> str:
@@ -83,7 +94,7 @@ def expand_env(value: str) -> str:
         if env_value is None:
             missing.append(match.group(1))
             return match.group(0)
-        return env_value
+        return quote(env_value, safe="") if quote_values else env_value
 
     expanded = _ENV_PATTERN.sub(replace, value)
     if missing:
@@ -91,11 +102,26 @@ def expand_env(value: str) -> str:
     return expanded
 
 
-async def probe_connection(url: str, timeout: int = CONNECT_TIMEOUT) -> None:
+def expand_url(url: str, engine: Engine) -> str:
+    """Expande ${VAR} na URL. No MongoDB, valores em usuário/senha são percent-encoded (exigido pela URI)."""
+    if engine != Engine.MONGODB or "://" not in url:
+        return expand_env(url)
+    scheme, rest = url.split("://", 1)
+    authority_end = next((i for i, c in enumerate(rest) if c in "/?"), len(rest))
+    at = rest.rfind("@", 0, authority_end)
+    if at < 0:
+        return expand_env(url)
+    return f"{scheme}://{expand_env(rest[:at], quote_values=True)}{expand_env(rest[at:])}"
+
+
+async def probe_connection(url: str, engine: Engine = Engine.POSTGRES, timeout: int = CONNECT_TIMEOUT) -> None:
     """Conexão avulsa de teste: falha rápido com o erro real (auth, DNS, recusa).
 
     O pool do psycopg re-tenta em segundo plano e só reporta timeout genérico.
     """
+    if engine == Engine.MONGODB:
+        await probe_mongo(url, timeout)
+        return
     conn = await psycopg.AsyncConnection.connect(url, connect_timeout=timeout, application_name="pg-multi-mcp")
     await conn.close()
 
@@ -103,7 +129,7 @@ async def probe_connection(url: str, timeout: int = CONNECT_TIMEOUT) -> None:
 def has_literal_password(url: str) -> bool:
     """True se a URL/DSN contém senha em texto puro (não um placeholder ${VAR})."""
     try:
-        password = conninfo_to_dict(url).get("password")
+        password = mongo_password(url) if is_mongo_url(url) else conninfo_to_dict(url).get("password")
     except Exception:
         return False
     return bool(password) and not _ENV_PATTERN.fullmatch(str(password))
@@ -115,7 +141,7 @@ class ConnectionConfig:
 
     name: str
     url: str
-    engine: Engine = Engine.POSTGRES
+    engine: Optional[Engine] = None  # None = inferido da URL (mongodb:// -> mongodb, senão postgres)
     access_mode: AccessMode = AccessMode.RESTRICTED
     description: str = ""
     aliases: list[str] = field(default_factory=list)
@@ -133,7 +159,9 @@ class ConnectionConfig:
         self.access_mode = AccessMode(self.access_mode)
         if not self.persistent and self.source == "file":
             self.source = "runtime"  # only file entries are owned (and reloaded) by the config file
-        engine =self.engine.value if isinstance(self.engine, Engine) else str(self.engine).lower()
+        if not self.engine:
+            self.engine = Engine.MONGODB if is_mongo_url(self.url) else Engine.POSTGRES
+        engine = self.engine.value if isinstance(self.engine, Engine) else str(self.engine).lower()
         try:
             self.engine = Engine(_ENGINE_ALIASES.get(engine, engine))
         except ValueError:
@@ -145,7 +173,7 @@ class ConnectionConfig:
         return cls(
             name=name,
             url=data.get("url", ""),
-            engine=data.get("engine", Engine.POSTGRES.value),
+            engine=data.get("engine"),
             access_mode=AccessMode(data.get("access_mode", AccessMode.RESTRICTED.value)),
             description=data.get("description", ""),
             aliases=list(data.get("aliases", [])),
@@ -168,9 +196,15 @@ class ConnectionConfig:
             "query_timeout": self.query_timeout,
         }
 
+    def resolved_url(self) -> str:
+        """URL com os placeholders ${VAR} expandidos (só no momento de conectar)."""
+        return expand_url(self.url, self.engine)
+
     def safe_target(self) -> dict[str, Any]:
         """Destino da conexão sem a senha (para exibir ao agente/usuário)."""
         try:
+            if self.engine == Engine.MONGODB:
+                return mongo_target(self.url)
             info = conninfo_to_dict(self.url)
             return {k: info[k] for k in ("host", "port", "dbname", "user") if info.get(k)}
         except Exception:
@@ -185,7 +219,7 @@ class ManagedConnection:
     """Estado em tempo de execução de uma conexão."""
 
     config: ConnectionConfig
-    pool: Optional[DbConnPool] = None
+    pool: Optional[Union[DbConnPool, MongoConnPool]] = None
     opened_at: Optional[float] = None
     last_used: Optional[float] = None
     last_error: Optional[str] = None
@@ -203,7 +237,8 @@ class ConnectionLease:
 
     name: str
     access_mode: AccessMode
-    driver: Union[SqlDriver, SafeSqlDriver]
+    driver: Union[SqlDriver, SafeSqlDriver, MongoDriver]
+    engine: Engine = Engine.POSTGRES
 
 
 class ConnectionManager:
@@ -514,10 +549,15 @@ class ConnectionManager:
     # ------------------------------------------------------------------ ciclo de vida
 
     @contextlib.asynccontextmanager
-    async def lease(self, name: Optional[str]) -> AsyncIterator[ConnectionLease]:
-        """Empresta o driver da conexão (abrindo o pool se preciso) durante a chamada."""
+    async def lease(self, name: Optional[str], require: Optional[Engine] = None) -> AsyncIterator[ConnectionLease]:
+        """Empresta o driver da conexão (abrindo o pool se preciso) durante a chamada.
+
+        require: motor exigido pela ferramenta; checado antes de abrir o pool.
+        """
         await self.refresh_if_changed()
         mc = self.resolve(name)
+        if require and mc.config.engine != require:
+            raise ConnectionConfigError(f"A conexão '{mc.config.name}' é {mc.config.engine.value}; esta ferramenta só funciona com {require.value}.")
         await self._ensure_open(mc)
         assert mc.pool is not None
 
@@ -525,10 +565,15 @@ class ConnectionManager:
         mc.last_used = time.monotonic()
         try:
             access_mode = self.effective_access_mode(mc)
-            driver: Union[SqlDriver, SafeSqlDriver] = SqlDriver(conn=mc.pool)
-            if access_mode == AccessMode.RESTRICTED:
-                driver = SafeSqlDriver(sql_driver=driver, timeout=mc.config.query_timeout)
-            yield ConnectionLease(name=mc.config.name, access_mode=access_mode, driver=driver)
+            restricted = access_mode == AccessMode.RESTRICTED
+            driver: Union[SqlDriver, SafeSqlDriver, MongoDriver]
+            if mc.config.engine == Engine.MONGODB:
+                driver = MongoDriver(conn=mc.pool, readonly=restricted, timeout=mc.config.query_timeout if restricted else None)  # type: ignore[arg-type]
+            else:
+                driver = SqlDriver(conn=mc.pool)
+                if restricted:
+                    driver = SafeSqlDriver(sql_driver=driver, timeout=mc.config.query_timeout)
+            yield ConnectionLease(name=mc.config.name, access_mode=access_mode, driver=driver, engine=mc.config.engine)
         finally:
             mc.active_leases -= 1
             mc.query_count += 1
@@ -546,10 +591,11 @@ class ConnectionManager:
                 return
             await self._evict_lru_unlocked(exclude=mc)
 
-            url = expand_env(mc.config.url)
-            pool = DbConnPool(url, min_size=1, max_size=mc.config.max_pool_size, connect_timeout=CONNECT_TIMEOUT)
+            url = mc.config.resolved_url()
+            pool_cls = MongoConnPool if mc.config.engine == Engine.MONGODB else DbConnPool
+            pool = pool_cls(url, min_size=1, max_size=mc.config.max_pool_size, connect_timeout=CONNECT_TIMEOUT)
             try:
-                await probe_connection(url)
+                await probe_connection(url, mc.config.engine)
                 await pool.pool_connect()
             except Exception as e:
                 mc.last_error = obfuscate_password(str(e))
