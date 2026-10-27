@@ -1,7 +1,7 @@
 [project]
 name = "pg-multi-mcp"
 version = "0.1.0"
-description = "MCP local com múltiplas conexões de banco nomeadas (PostgreSQL), gerenciadas pela IA"
+description = "MCP local com múltiplas conexões de banco nomeadas (PostgreSQL e MongoDB), gerenciadas pela IA"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -11,6 +11,7 @@ dependencies = [
     "pglast>=7.20,<8",
     "humanize>=4.15.0",
     "attrs>=25.4.0",
+    "pymongo[srv]>=4.13,<5",
 ]
 license = "MIT"
 license-files = ["LICENSE"]

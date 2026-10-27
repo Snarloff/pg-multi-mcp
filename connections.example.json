@@ -43,6 +43,18 @@
         "production",
         "sales"
       ]
+    },
+    "orders_mongo": {
+      "url": "mongodb://reader:${MONGO_ORDERS_PASSWORD}@mongo.example.com:27017/orders?authSource=admin&tls=true",
+      "access_mode": "restricted",
+      "description": "Orders - MongoDB (read-only user with the 'read' role)",
+      "aliases": [
+        "orders"
+      ],
+      "tags": [
+        "mongodb",
+        "orders"
+      ]
     }
   }
 }

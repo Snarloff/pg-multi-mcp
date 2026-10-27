@@ -6,9 +6,9 @@ A local [MCP](https://modelcontextprotocol.io) server that gives an AI assistant
 connections at once**. You say *"list the tables in the staging database"* and the assistant finds the right
 connection by name or alias, reuses an already-open pool, and closes pools that sit idle.
 
-Today it supports **PostgreSQL**. The core (connection registry, name resolution, pool lifecycle, config reload)
-does not depend on the engine: every connection has an `engine` field and PostgreSQL-specific code lives in its own
-subpackage, so other engines can be added later.
+It supports **PostgreSQL** and **MongoDB**. The core (connection registry, name resolution, pool lifecycle, config
+reload) does not depend on the engine: every connection has an `engine` field (inferred from the URL when omitted)
+and engine-specific code lives in its own subpackage (`postgres/`, `mongodb/`).
 
 ---
 
@@ -48,7 +48,8 @@ subpackage, so other engines can be added later.
 | Fast, real connection errors | Wrong password, DNS or closed port are reported in seconds, not as a generic timeout |
 | Live config reload | Edits to the config file apply on the next call; unchanged connections keep their pools |
 | PostgreSQL analysis tools | Explain plans (including hypothetical indexes via HypoPG), health checks, index recommendations, top queries |
-| Safe output size | `execute_sql` truncates large results (`max_rows`, default 500) |
+| MongoDB support | `execute_mongo` (find, aggregate, count, distinct, read-only commands; writes on `unrestricted`), plus databases, collections, indexes and a sampled field/type schema through the generic tools |
+| Safe output size | `execute_sql` and `execute_mongo` truncate large results (`max_rows`, default 500); MongoDB truncates on the server |
 | No secret leakage | Passwords never appear in listings or error messages |
 
 ## Requirements
@@ -58,6 +59,7 @@ subpackage, so other engines can be added later.
 - Optional: [`uv`](https://docs.astral.sh/uv/) if you want to run it with `uvx` instead of a local virtualenv
 - Optional PostgreSQL extensions for some tools: `pg_stat_statements` (top queries, workload analysis) and
   `hypopg` (hypothetical indexes)
+- MongoDB **4.2+** for MongoDB connections (driver: `pymongo` with its native asyncio client)
 
 ## Installation
 
@@ -150,6 +152,12 @@ comes back if the override is removed. If the `DATABASE_URI` variable is set, it
       "tags": ["staging", "sales"],
       "max_pool_size": 2,
       "query_timeout": 30
+    },
+    "orders_mongo": {
+      "url": "mongodb://reader:${MONGO_ORDERS_PASSWORD}@mongo.example.com:27017/orders?authSource=admin&tls=true",
+      "description": "Orders - MongoDB (read-only)",
+      "aliases": ["orders"],
+      "tags": ["mongodb"]
     }
   }
 }
@@ -169,14 +177,14 @@ comes back if the override is removed. If the `DATABASE_URI` variable is set, it
 | Field | Required | Default | Description |
 |---|---|---|---|
 | *(key)* | yes | — | Connection name: letters, digits, `_`, `-`, `.`; up to 63 chars |
-| `url` | yes | — | libpq URI (`postgresql://user@host:port/db?sslmode=require`) or key/value DSN (`host=... dbname=...`). `${VAR}` placeholders are expanded from environment variables at connect time |
-| `engine` | no | `postgres` | Database engine (`postgresql` and `pg` are accepted as aliases) |
-| `access_mode` | no | `restricted` | `restricted` = read-only; `unrestricted` = any SQL, including DML/DDL |
+| `url` | yes | — | PostgreSQL: libpq URI (`postgresql://user@host:port/db?sslmode=require`) or key/value DSN (`host=... dbname=...`). MongoDB: `mongodb://` or `mongodb+srv://` URI; the path is the default database. `${VAR}` placeholders are expanded from environment variables at connect time (in a MongoDB user/password they are percent-encoded for you) |
+| `engine` | no | from the URL | `postgres` or `mongodb`; inferred from the URL (`mongodb://`, `mongodb+srv://` → `mongodb`, anything else → `postgres`); if the whole URL is a placeholder such as `${MONGO_URI}`, set `engine` explicitly. Aliases: `postgresql`, `pg`, `mongo` |
+| `access_mode` | no | `restricted` | `restricted` = read-only; `unrestricted` = any SQL / MongoDB write, including DML/DDL |
 | `description` | no | `""` | Free text; used by search |
 | `aliases` | no | `[]` | Alternative names the assistant can use to find the connection |
 | `tags` | no | `[]` | Grouping/search labels such as `production`, `staging` |
 | `max_pool_size` | no | `3` | Maximum connections in this pool |
-| `query_timeout` | no | `30` | Query timeout in seconds for `restricted` connections |
+| `query_timeout` | no | `30` | Query/operation timeout in seconds for `restricted` connections |
 
 Names and aliases must be unique across all connections after normalization (case, accents and separators are
 ignored), so `Sales-Staging`, `sales_staging` and `Sales Staging` are the same key.
@@ -307,17 +315,30 @@ are in Portuguese.
 | `use_connection` | `connection` | Validates the connection (opens it) and makes it the session's active connection |
 | `open_connection` | `connection?` | Opens or reuses the pool and returns database, user, server version and latency |
 | `close_connection` | `connection?`, `close_all=false` | Closes one pool or all of them. The definition is kept and reopens on next use |
-| `add_connection` | `name`, `url`, `access_mode="restricted"`, `description`, `aliases`, `tags`, `persist=true`, `test=true`, `overwrite=false`, `engine="postgres"` | Adds a connection. With `test=true` it connects first and adds nothing on failure. With `persist=true` it is written to the file; otherwise it lives only in the session |
+| `add_connection` | `name`, `url`, `access_mode="restricted"`, `description`, `aliases`, `tags`, `persist=true`, `test=true`, `overwrite=false`, `engine` (inferred from the URL) | Adds a connection. With `test=true` it connects first and adds nothing on failure. With `persist=true` it is written to the file; otherwise it lives only in the session |
 | `remove_connection` | `connection` | Closes and removes a connection (also from the file if it came from there). Removing an env override brings back the file entry |
 | `reload_connections` | — | Re-reads the file now and reports `added`, `changed`, `removed`, `unchanged` |
 
-### Database (PostgreSQL)
+### Database (PostgreSQL and MongoDB)
+
+| Tool | Main arguments | PostgreSQL | MongoDB |
+|---|---|---|---|
+| `list_schemas` | — | Lists schemas and classifies them as user/system | Lists the databases the user can see, with size |
+| `list_objects` | `schema_name`, `object_type="table"` | Lists tables, views, sequences or extensions | `schema_name` is the database; `object_type` `collection`/`table` or `view` |
+| `get_object_details` | `schema_name`, `object_name`, `object_type="table"` | Columns, constraints and indexes of a table/view; details of a sequence or extension | Type, estimated count, indexes and the fields/types found in a sample of 100 documents (field names, types and how many documents have them — **never the values**) |
+
+### MongoDB
 
 | Tool | Main arguments | What it does |
 |---|---|---|
-| `list_schemas` | — | Lists schemas and classifies them as user/system |
-| `list_objects` | `schema_name`, `object_type="table"` | Lists tables, views, sequences or extensions |
-| `get_object_details` | `schema_name`, `object_name`, `object_type="table"` | Columns, constraints and indexes of a table/view; details of a sequence or extension |
+| `execute_mongo` | `operation`, `collection`, `database?`, `filter={}`, `projection?`, `sort?`, `skip=0`, `limit=0`, `pipeline=[]`, `field?`, `documents=[]`, `update?`, `upsert=false`, `command?`, `explain=false`, `max_rows=500` | Reads: `find`, `aggregate`, `count`, `distinct`, `command`. Writes (only on `unrestricted`): `insert_one`, `insert_many`, `update_one`, `update_many`, `replace_one`, `delete_one`, `delete_many`. `filter`/`pipeline` accept Extended JSON (`{"_id": {"$oid": "..."}}`); results come back as relaxed Extended JSON. `explain=true` returns the query plan of a `find`/`aggregate`. `database` defaults to the one in the URL |
+
+### PostgreSQL only
+
+These reject MongoDB connections with a clear message (before opening a pool).
+
+| Tool | Main arguments | What it does |
+|---|---|---|
 | `execute_sql` | `sql`, `max_rows=500` | Runs SQL. Read-only on `restricted` connections. Results above `max_rows` are truncated and flagged |
 | `explain_query` | `sql`, `analyze=false`, `hypothetical_indexes=[]` | Execution plan; `analyze=true` runs the query for real timings; hypothetical indexes need HypoPG |
 | `analyze_workload_indexes` | `max_index_size_mb=10000` | Recommends indexes from the workload in `pg_stat_statements` |
@@ -384,7 +405,17 @@ Changes to `.mcp.json` itself are only read when the client restarts the server.
 - Everything runs inside a `READ ONLY` transaction, so PostgreSQL itself rejects any write that gets through.
 - Queries are aborted after `query_timeout` seconds.
 
-**`unrestricted`**: any SQL, including `INSERT`, `UPDATE`, `DELETE`, `DROP`. Use only for databases you own.
+**`restricted` on MongoDB** — MongoDB has no read-only transaction, so the allowlist is the application's only
+barrier; **use a database user with the `read` role** as the real guarantee.
+
+- Only `find`, `aggregate`, `count`, `distinct` and a few read-only commands (`ping`, `buildInfo`, `dbStats`,
+  `collStats`, `listCollections`, `listIndexes`, `listDatabases`, `serverStatus`, `connectionStatus`, `hostInfo`).
+- `$out` and `$merge` (writes) and `$where`, `$function`, `$accumulator` (server-side JavaScript) are rejected at any
+  depth of the filter or pipeline (including `$lookup`, `$facet`, `$unionWith`).
+- Every operation is aborted after `query_timeout` seconds.
+
+**`unrestricted`**: any SQL, including `INSERT`, `UPDATE`, `DELETE`, `DROP`; on MongoDB, also the insert, update,
+replace and delete operations. Use only for databases you own.
 
 **Global cap:** `--access-mode restricted` forces every connection to read-only, even if someone sets
 `unrestricted` in the file or adds one from the chat. `--lock-config` additionally prevents adding or removing
@@ -426,6 +457,9 @@ connections.
 | `config_error` in `list_connections` | The file has invalid JSON or a duplicate name/alias; the message shows line/column |
 | `conflita com a conexão existente` / `usado por` | Two connections share a name or alias after normalization |
 | Restricted query rejected | The statement or a function is not on the read-only allowlist. Use a `SELECT` or an `unrestricted` connection |
+| `esta ferramenta só funciona com postgres` / `mongodb` | The tool does not apply to that engine: on MongoDB use `execute_mongo` instead of `execute_sql`; `explain_query`, `analyze_*` and `get_top_queries` are PostgreSQL only |
+| MongoDB `Authentication failed` | Wrong user/password or `authSource` (users created in `admin` need `?authSource=admin`) |
+| MongoDB `Informe o banco` | The URL has no default database: pass `database` / `schema_name`, or add `/dbname` to the URL |
 | Edits to `.mcp.json` not applied | The client reads it only on (re)start: restart or reconnect the server |
 | `WinError 32` when reinstalling (`pip install -e .`) | The MCP client is running `pg-multi-mcp.exe`, so Windows locks it. Stop or disable the server in the client first (Claude Code: `/mcp`), reinstall, then reconnect. Code changes in `src/` do not need a reinstall, only a server restart |
 | Need more detail | Run with `--log-level DEBUG`; logs go to stderr / the client's MCP log |
@@ -438,6 +472,7 @@ src/
     ├── __init__.py          main(): starts the event loop (SelectorEventLoop on Windows)
     ├── server.py            MCP tools and command-line options
     ├── connections.py       Registry, name resolution, pools, LRU, idle reaper, reload, persistence
+    ├── mongodb/             MongoDB-specific code: pool, driver, read-only allowlist, schema sampling
     └── postgres/            PostgreSQL-specific code
         ├── sql/             Driver, pool, read-only SQL validation, extensions
         ├── explain/         Explain plans and hypothetical indexes
@@ -447,16 +482,18 @@ src/
 tests/
 ├── unit/test_connections.py Registry, reload, env, persistence
 ├── unit/test_server.py      Tool routing and responses
+├── unit/mongodb/            MongoDB module tests (read-only allowlist, driver)
 └── unit/postgres/           PostgreSQL module tests
 ```
 
-**Adding another engine (roadmap):**
+**Adding another engine** (MongoDB followed these steps):
 
-1. Add a value to `Engine` in [connections.py](src/pg_multi_mcp/connections.py).
-2. Create `src/pg_multi_mcp/<engine>/` with a driver: pool, query execution and a read-only mode.
-3. Make `ConnectionManager` pick the pool/driver from the connection's `engine`.
-4. Dispatch the generic tools (`list_schemas`, `execute_sql`, ...) by engine; PostgreSQL-only tools reject other
-   engines.
+1. Add a value to `Engine` in [connections.py](src/pg_multi_mcp/connections.py) (and URL inference if it has its own scheme).
+2. Create `src/pg_multi_mcp/<engine>/` with a pool (same interface as `DbConnPool`: `pool_connect()`, `close()`,
+   `pool`, `server_version`), a driver and a read-only mode.
+3. Pick the pool/driver from the connection's `engine` in `ConnectionManager._ensure_open` and `lease`.
+4. Dispatch the generic tools (`list_schemas`, `list_objects`, ...) by `lease.engine`; engine-specific tools pass
+   `require=Engine.X` to `lease`, which rejects other engines before opening a pool.
 
 ## Development
 
